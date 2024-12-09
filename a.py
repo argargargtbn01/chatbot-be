@@ -1,8 +1,9 @@
-from flask import Flask, request, jsonify
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from flask import Flask, request, Response, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 from flask_cors import CORS
+import requests
+import json
 
 app = Flask(__name__)
 CORS(app)
@@ -11,11 +12,6 @@ CORS(app)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:argargargtbn1@localhost:5432/chatbot'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
-
-# Khởi tạo mô hình và tokenizer
-model_name = "EleutherAI/gpt-neo-125M"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name)
 
 # Models cho SQLAlchemy
 class Chat(db.Model):
@@ -32,34 +28,36 @@ class Message(db.Model):
     content = db.Column(db.Text, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-# Tạo bảng nếu chưa có
 with app.app_context():
     db.create_all()
 
-def generate_response(user_input):
-    """
-    Sinh phản hồi từ mô hình dựa trên đầu vào từ người dùng.
-    """
-    prompt = f"Solve this math problem: {user_input}"
-    inputs = tokenizer(prompt, return_tensors="pt")
-    outputs = model.generate(inputs['input_ids'], max_length=50, num_return_sequences=1)
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+def generate_response_stream(user_input):
+    api_url = "http://localhost:11434/api/generate"
+    payload = {
+        "model": "qwen2-math:1.5b-instruct",
+        "prompt": user_input
+    }
+    try:
+        with requests.post(api_url, json=payload, stream=True) as response:
+            if response.status_code == 200:
+                for chunk in response.iter_lines(decode_unicode=True):
+                    if chunk:
+                        yield chunk
+            else:
+                yield json.dumps({"error": response.text})
+    except requests.exceptions.RequestException as e:
+        yield json.dumps({"error": str(e)})
 
 def get_or_create_chat(session_name):
-    """
-    Lấy phiên hội thoại nếu đã tồn tại hoặc tạo phiên mới nếu chưa có.
-    """
-    new_chat = Chat(name=session_name)
-    db.session.add(new_chat)
-    db.session.commit()
-    return new_chat
+    chat = Chat.query.filter_by(name=session_name).first()
+    if not chat:
+        chat = Chat(name=session_name)
+        db.session.add(chat)
+        db.session.commit()
+    return chat
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    """
-    API để xử lý cuộc hội thoại của người dùng. Nếu không có chat_id,
-    sẽ tạo một phiên hội thoại mới.
-    """
     data = request.get_json()
     chat_id = data.get('chat_id')
     user_message = data.get('message')
@@ -67,7 +65,6 @@ def chat():
     if not user_message:
         return jsonify({'error': 'No message provided'}), 400
 
-    # Xử lý tạo hoặc lấy chat_id
     if not chat_id:
         session_name = user_message[:30]
         chat_session = get_or_create_chat(session_name)
@@ -77,35 +74,45 @@ def chat():
         if not chat_session:
             return jsonify({'error': 'Invalid chat_id'}), 400
 
-    # Lưu tin nhắn của người dùng
     user_msg = Message(chat_id=chat_id, sender="User", content=user_message)
     db.session.add(user_msg)
-
-    # Gọi hàm generate_response để tạo phản hồi từ bot
-    bot_response = generate_response(user_message)
-
-    # Lưu phản hồi của bot
-    bot_msg = Message(chat_id=chat_id, sender="Bot", content=bot_response)
-    db.session.add(bot_msg)
     db.session.commit()
 
-    return jsonify({'chat_id': chat_id, 'response': bot_response})
+    # Sử dụng response_generator để stream phản hồi
+    def response_generator():
+        complete_response = ""
+
+        for chunk in generate_response_stream(user_message):
+
+            try:
+                parsed_chunk = json.loads(chunk)
+                response_part = parsed_chunk.get("response", "")
+
+                complete_response += response_part
+                yield json.dumps({"response": response_part}) + "\n"
+
+            except json.JSONDecodeError:
+                yield json.dumps({"response": chunk}) + "\n"
+
+        # Lưu phản hồi hoàn chỉnh vào database trong application context
+        with app.app_context():
+            bot_message = Message(chat_id=chat_id, sender="Bot", content=complete_response.strip())
+            db.session.add(bot_message)
+            db.session.commit()
+
+
+    # Trả về Response từ hàm chat
+    return Response(response_generator(), content_type='application/json')
+
 
 @app.route('/chat-session', methods=['GET'])
 def get_chat_sessions():
-    """
-    API để lấy danh sách các phiên hội thoại, sắp xếp theo thứ tự giảm dần của created_at.
-    """
     chat_sessions = Chat.query.order_by(Chat.created_at.desc()).all()
     result = [{"chat_id": chat.id, "name": chat.name} for chat in chat_sessions]
     return jsonify(result)
 
 @app.route('/message', methods=['GET'])
 def get_messages():
-    """
-    API để lấy tất cả các tin nhắn trong một phiên hội thoại,
-    sắp xếp theo thứ tự giảm dần của created_at.
-    """
     chat_id = request.args.get('chat_id')
     if not chat_id:
         return jsonify({'error': 'No chat_id provided'}), 400
@@ -115,4 +122,4 @@ def get_messages():
     return jsonify(result)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=4000)
